@@ -1,0 +1,10 @@
+flask==2.3.2
+numpy==1.26.4
+Pillow==10.2.0
+opencv-python==4.8.0.74
+boto3==1.34.0
+
+# Torch + torchvision for CPU on Amazon Linux
+torch==2.2.0
+torchvision==0.17.0
+
