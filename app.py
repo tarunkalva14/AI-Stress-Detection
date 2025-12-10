@@ -16,6 +16,7 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 MODEL_PATH = "stress_model.pth"
 S3_BUCKET = "stress-detection-s3"   # replace with your bucket name or leave as-is
 SMOOTH_WINDOW = 5
+LOG_FILE = "predictions.log"        # persistent log file
 
 print("Device:", DEVICE)
 
@@ -46,6 +47,14 @@ def predict_confidence_from_bgr(frame_bgr):
     smooth_buf.append(p_stress)
     avg = float(sum(smooth_buf) / len(smooth_buf))
     return avg  # 0..1
+
+def save_log(label, conf_pct):
+    """Append prediction to persistent log file."""
+    try:
+        with open(LOG_FILE, "a") as f:
+            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {label} - {conf_pct}%\n")
+    except Exception as e:
+        print("Failed to write log:", e)
 
 # ---------- S3 ----------
 s3 = boto3.client("s3")
@@ -81,7 +90,9 @@ def predict_frame():
 
     conf = predict_confidence_from_bgr(frame)  # 0..1
     conf_pct = round(conf * 100, 1)
+    label = "Stressed" if conf_pct >= 50 else "Relaxed"  # simple threshold for logging
 
+    save_log(label, conf_pct)                 # <-- save log
     s3_key = upload_frame_to_s3(frame)
 
     return jsonify({"confidence": conf_pct, "s3_key": s3_key})
@@ -109,6 +120,9 @@ def predict_video():
         return jsonify({"error": "No frames"}), 400
     avg = float(sum(probs) / len(probs))
     conf_pct = round(avg * 100, 1)
+    label = "Stressed" if conf_pct >= 50 else "Relaxed"
+    save_log(label, conf_pct)                # <-- save log
+
     s3_key = None
     if last_frame is not None:
         s3_key = upload_frame_to_s3(last_frame)
