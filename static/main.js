@@ -1,4 +1,3 @@
-// static/main.js
 let video = document.getElementById("video");
 let startBtn = document.getElementById("start");
 let stopBtn = document.getElementById("stop");
@@ -10,7 +9,11 @@ let stream = null;
 let intervalId = null;
 let running = false;
 
-// ------------------- Trend Chart -------------------
+// calibration and threshold
+let threshold = 50.0; // percent
+let calibrated = false;
+
+// Chart config
 const MAX_POINTS = 30;
 let stressData = [];
 let labels = [];
@@ -31,24 +34,28 @@ const trendChart = new Chart(ctx, {
     },
     options: {
         responsive: true,
-        animation: { duration: 300 },
-        scales: {
-            y: { min: 0, max: 100, title: { display: true, text: 'Stress %' } },
-            x: { display: false }
-        }
+        animation: { duration: 200 },
+        scales: { y: { min: 0, max: 100 }, x: { display: false } }
     }
 });
 
-// ------------------- Webcam Functions -------------------
+// start camera
 async function startCamera() {
     if (stream) return;
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+        alert("Camera not supported in this browser.");
+        status.innerText = "Status: camera unsupported";
+        return;
+    }
     try {
         stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
         video.srcObject = stream;
-        video.play();
+        await video.play();
+        status.innerText = "Status: camera ready";
     } catch (e) {
-        status.innerText = "Status: camera error";
         console.error(e);
+        status.innerText = "Status: camera error";
+        alert("Unable to access camera. Make sure you allow it in browser and use HTTPS.");
     }
 }
 
@@ -59,7 +66,7 @@ function stopCamera() {
     }
 }
 
-// Convert dataURL to Blob
+// Convert dataURL to blob
 function dataURLtoBlob(dataurl) {
     let arr = dataurl.split(','), mime = arr[0].match(/:(.*?);/)[1];
     let bstr = atob(arr[1]), n = bstr.length, u8arr = new Uint8Array(n);
@@ -67,73 +74,95 @@ function dataURLtoBlob(dataurl) {
     return new Blob([u8arr], { type: mime });
 }
 
-// ------------------- Frame Prediction -------------------
-async function sendFrame() {
-    if (!stream) return;
-    let canvas = document.createElement("canvas");
+// Send frame to Flask and get confidence
+async function sendFrameAndGetConfidence() {
+    if (!stream) return null;
+    const canvas = document.createElement("canvas");
     canvas.width = video.videoWidth || 480;
     canvas.height = video.videoHeight || 360;
-    let ctxCanvas = canvas.getContext("2d");
-    ctxCanvas.drawImage(video, 0, 0, canvas.width, canvas.height);
-
-    let dataUrl = canvas.toDataURL("image/jpeg", 0.8);
-    let blob = dataURLtoBlob(dataUrl);
-
-    let form = new FormData();
+    const ctxC = canvas.getContext("2d");
+    ctxC.drawImage(video, 0, 0, canvas.width, canvas.height);
+    const dataUrl = canvas.toDataURL("image/jpeg", 0.8);
+    const blob = dataURLtoBlob(dataUrl);
+    const form = new FormData();
     form.append("image", blob, "frame.jpg");
-
-    status.innerText = "Status: sending...";
     try {
-        let resp = await fetch("/predict_frame", { method: "POST", body: form });
+        const resp = await fetch("/predict_frame", { method: "POST", body: form });
         if (!resp.ok) {
-            status.innerText = "Status: error " + resp.status;
-            return;
+            console.error("Server error", resp.status);
+            return null;
         }
-
-        let j = await resp.json();
+        const j = await resp.json();
         if (j.error) {
-            status.innerText = "Status: " + j.error;
-            return;
+            console.error("API error", j.error);
+            return null;
         }
-
-        let label = j.label;
-        let conf = j.confidence.toFixed(1);
-
-        // Update current prediction
-        result.innerHTML = `<span class="${label === 'Stressed' ? 'stressed' : 'relaxed'}">${label} — ${conf}%</span>`;
-
-        // Update trend chart
-        if (stressData.length >= MAX_POINTS) {
-            stressData.shift();
-            labels.shift();
-        }
-        stressData.push(conf);
-        labels.push(new Date().toLocaleTimeString());
-        trendChart.update();
-
-        // Update logs
-        const logEntry = `[${new Date().toLocaleTimeString()}] ${label} (${conf}%)`;
-        logEl.innerText = logEntry + "\n" + logEl.innerText;
-
-        status.innerText = "Status: idle";
-
+        return j.confidence; // numeric percent
     } catch (e) {
-        console.error(e);
-        status.innerText = "Status: network error";
+        console.error("Network error", e);
+        return null;
     }
 }
 
-// ------------------- Buttons -------------------
+function decideLabelFromConfidence(conf) {
+    return (conf >= threshold) ? "Stressed" : "Relaxed";
+}
+
+async function sendFrameLoop() {
+    const conf = await sendFrameAndGetConfidence();
+    if (conf === null) {
+        status.innerText = "Status: error";
+        return;
+    }
+
+    const label = decideLabelFromConfidence(conf);
+
+    result.innerHTML = `<span class="${label === 'Stressed' ? 'stressed' : 'relaxed'}">${label} — ${conf}%</span>`;
+    status.innerText = `Status: running (threshold ${threshold.toFixed(1)}%)`;
+
+    if (stressData.length >= MAX_POINTS) { stressData.shift(); labels.shift(); }
+    stressData.push(conf);
+    labels.push(new Date().toLocaleTimeString());
+    trendChart.update();
+
+    const logEntry = `[${new Date().toLocaleTimeString()}] ${label} (${conf}%)`;
+    logEl.innerText = logEntry + "\n" + logEl.innerText;
+}
+
+// calibration: capture N frames, set threshold = avg + margin
+async function calibrateBaseline(frames = 30, margin = 15.0) {
+    if (!stream) {
+        await startCamera();
+        if (!stream) return;
+    }
+    status.innerText = "Calibrating... keep a neutral face";
+    const vals = [];
+    for (let i = 0; i < frames; i++) {
+        const v = await sendFrameAndGetConfidence();
+        if (v !== null) vals.push(v);
+        await new Promise(r => setTimeout(r, 150));
+    }
+    if (vals.length === 0) {
+        status.innerText = "Calibration failed";
+        alert("Calibration failed. Make sure camera is working.");
+        return;
+    }
+    const avg = vals.reduce((a,b) => a+b, 0) / vals.length;
+    threshold = Math.min(95, avg + margin);
+    calibrated = true;
+    status.innerText = `Calibrated. baseline ${avg.toFixed(1)}% → threshold ${threshold.toFixed(1)}%`;
+}
+
 startBtn.onclick = async () => {
     await startCamera();
     running = true;
-    intervalId = setInterval(() => { if (running) sendFrame(); }, 500);
+    intervalId = setInterval(() => { if (running) sendFrameLoop(); }, 600);
     status.innerText = "Status: running";
-}
+};
 
 stopBtn.onclick = () => {
     running = false;
     clearInterval(intervalId);
     stopCamera();
     status.innerText = "Status: stopped";
-}
+};
