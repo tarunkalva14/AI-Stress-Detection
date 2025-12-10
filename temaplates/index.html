@@ -1,0 +1,157 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>AI Stress Detection API</title>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+
+  <style>
+    body {
+      margin: 0;
+      font-family: Segoe UI, system-ui;
+      background: linear-gradient(120deg, #e0f7fa, #f1f8e9);
+      color: #333;
+    }
+
+    #container {
+      display: flex;
+      gap: 20px;
+      padding: 20px;
+      justify-content: center;
+      flex-wrap: wrap;
+    }
+
+    #left, #right {
+      background: #fff;
+      padding: 20px;
+      border-radius: 12px;
+      box-shadow: 0 6px 18px rgba(0,0,0,0.08);
+    }
+
+    #left {
+      flex: 2;
+      text-align: center;
+    }
+
+    #right {
+      flex: 1;
+      max-width: 400px;
+    }
+
+    video {
+      width: 100%;
+      max-width: 640px;
+      border-radius: 10px;
+      border: 3px solid #00796b;
+    }
+
+    #controls {
+      margin-top: 12px;
+    }
+
+    button {
+      padding: 10px 18px;
+      margin: 5px;
+      border-radius: 8px;
+      border: none;
+      cursor: pointer;
+      font-weight: 600;
+      font-size: 15px;
+    }
+
+    #start {
+      background: #00796b;
+      color: #fff;
+    }
+
+    #stop {
+      background: #c62828;
+      color: #fff;
+    }
+
+    #calibrate {
+      background: #ff9800;
+      color: #fff;
+    }
+
+    #status {
+      margin-top: 10px;
+      font-weight: 600;
+      color: #444;
+    }
+
+    #result {
+      padding: 15px;
+      text-align: center;
+      border-radius: 10px;
+      font-size: 20px;
+      font-weight: 700;
+    }
+
+    .stressed {
+      color: #b00020;
+      background: #ffebee;
+      padding: 10px;
+      border-radius: 8px;
+    }
+
+    .relaxed {
+      color: #007700;
+      background: #e6f4ea;
+      padding: 10px;
+      border-radius: 8px;
+    }
+
+    #log {
+      max-height: 200px;
+      overflow-y: auto;
+      padding: 10px;
+      background: #f1f8e9;
+      border-radius: 8px;
+      font-family: monospace;
+      white-space: pre-line;
+      font-size: 14px;
+    }
+
+    @media(max-width: 900px) {
+      #container {
+        flex-direction: column;
+      }
+    }
+  </style>
+</head>
+
+<body>
+  <div id="container">
+
+    <div id="left">
+      <h2>AI Stress Detection — Live Webcam</h2>
+
+      <video id="video" autoplay muted playsinline></video>
+
+      <div id="controls">
+        <button id="start">Start</button>
+        <button id="stop">Stop</button>
+        <button id="calibrate">Calibrate</button>
+      </div>
+
+      <div id="status">Status: idle</div>
+    </div>
+
+    <div id="right">
+      <h3>Current Prediction</h3>
+      <div id="result">—</div>
+
+      <h3>Stress Trend</h3>
+      <canvas id="trendChart"></canvas>
+
+      <h3>Recent Logs</h3>
+      <div id="log">No logs yet</div>
+    </div>
+
+  </div>
+
+  <script src="/static/main.js"></script>
+</body>
+</html>
