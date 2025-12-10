@@ -1,115 +1,119 @@
+# app.py
+import os
+import time
+import cv2
+import boto3
+import torch
+import numpy as np
+from collections import deque
 from flask import Flask, request, jsonify, render_template
-import torch, os, cv2, numpy as np
-from torchvision import models
-from utils import extract_face_pil, preprocess_pil_to_tensor, append_log, pil_to_jpeg_bytes, upload_to_s3_bytes
 from PIL import Image
+from torchvision import models
+import torch.nn as nn
 
-app = Flask(__name__)
-
-# ----------------- CONFIG -----------------
-DEVICE = "cpu"
+# ---------- CONFIG ----------
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 MODEL_PATH = "stress_model.pth"
+S3_BUCKET = "stress-detection-s3"   # replace with your bucket name or leave as-is
+SMOOTH_WINDOW = 5
+
+print("Device:", DEVICE)
+
+# ---------- LOAD MODEL ----------
 model = models.resnet18(weights=None)
-model.fc = torch.nn.Linear(model.fc.in_features, 2)
+model.fc = nn.Linear(model.fc.in_features, 2)
 model.load_state_dict(torch.load(MODEL_PATH, map_location=DEVICE))
 model.to(DEVICE)
 model.eval()
-# ------------------------------------------
 
-# ----------------- RUN MODE -----------------
-LOCAL_RUN = int(os.environ.get("LOCAL_RUN", "1"))
-if LOCAL_RUN:
-    cap = cv2.VideoCapture(0)
-# ------------------------------------------
+# ---------- HELPERS ----------
+def preprocess_pil(pil_img):
+    pil = pil_img.resize((64, 64)).convert("RGB")
+    arr = np.array(pil).astype("float32") / 255.0
+    arr = np.transpose(arr, (2, 0, 1))
+    tensor = torch.tensor(arr).unsqueeze(0).float().to(DEVICE)
+    return tensor
+
+smooth_buf = deque(maxlen=SMOOTH_WINDOW)
+
+def predict_confidence_from_bgr(frame_bgr):
+    pil = Image.fromarray(cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB))
+    t = preprocess_pil(pil)
+    with torch.no_grad():
+        out = model(t)
+        probs = torch.softmax(out, dim=1)[0].cpu().numpy()
+    p_stress = float(probs[1])  # class 1 = stressed
+    smooth_buf.append(p_stress)
+    avg = float(sum(smooth_buf) / len(smooth_buf))
+    return avg  # 0..1
+
+# ---------- S3 ----------
+s3 = boto3.client("s3")
+
+def upload_frame_to_s3(frame_bgr):
+    try:
+        _, buf = cv2.imencode(".jpg", frame_bgr)
+        key = f"predictions/{int(time.time())}.jpg"
+        s3.put_object(Bucket=S3_BUCKET, Key=key, Body=buf.tobytes(), ContentType="image/jpeg")
+        return key
+    except Exception as e:
+        # If upload fails, return None (upload is optional)
+        print("S3 upload failed:", e)
+        return None
+
+# ---------- FLASK ----------
+app = Flask(__name__, template_folder="templates", static_folder="static")
 
 @app.route("/")
 def home():
     return render_template("index.html")
 
-def predict_image(img_pil):
-    face, _ = extract_face_pil(img_pil)
-    if face is None:
-        return "NoFace", 0.0
-    arr = preprocess_pil_to_tensor(face)
-    tensor = torch.tensor(arr).unsqueeze(0).to(DEVICE)
-    with torch.no_grad():
-        out = model(tensor)
-        probs = torch.softmax(out, dim=1)[0].cpu().numpy()
-        conf = float(probs[1]*100)
-        label = "Stressed" if conf > 50 else "Relaxed"
-        return label, conf
-
 @app.route("/predict_frame", methods=["POST"])
 def predict_frame():
-    try:
-        if LOCAL_RUN:
-            ret, frame = cap.read()
-            if not ret:
-                return jsonify({"error":"Failed to capture frame"})
-            pil_img = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-        else:
-            if "image" not in request.files:
-                return jsonify({"error":"No image uploaded"})
-            file = request.files["image"]
-            pil_img = Image.open(file.stream).convert("RGB")
+    if "image" not in request.files:
+        return jsonify({"error": "No image uploaded"}), 400
+    file = request.files["image"]
+    data = file.read()
+    nparr = np.frombuffer(data, np.uint8)
+    frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+    if frame is None:
+        return jsonify({"error": "Invalid image"}), 400
 
-        label, conf = predict_image(pil_img)
+    conf = predict_confidence_from_bgr(frame)  # 0..1
+    conf_pct = round(conf * 100, 1)
 
-        # ------------------- Logging -------------------
-        log_data = {"label": label, "confidence": conf}
-        append_log(log_data)  # local log
-        # Upload log + frame to S3
-        img_bytes = pil_to_jpeg_bytes(pil_img)
-        s3_key = f"logs/{label}_{int(conf)}_{int(torch.randint(0,1000000,(1,)))}.jpg"
-        upload_to_s3_bytes(img_bytes, s3_key)
-        # -----------------------------------------------
+    s3_key = upload_frame_to_s3(frame)
 
-        return jsonify({"label": label, "confidence": conf})
-
-    except Exception as e:
-        return jsonify({"error": str(e)})
+    return jsonify({"confidence": conf_pct, "s3_key": s3_key})
 
 @app.route("/predict", methods=["POST"])
 def predict_video():
-    try:
-        if "file" not in request.files:
-            return jsonify({"error":"No file uploaded"})
-        file = request.files["file"]
-        temp_path = "temp_video.avi"
-        file.save(temp_path)
-        cap_vid = cv2.VideoCapture(temp_path)
-        stress_probs = []
-
-        while True:
-            ret, frame = cap_vid.read()
-            if not ret:
-                break
-            pil_frame = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-            _, conf = predict_image(pil_frame)
-            stress_probs.append(conf/100)
-            # Upload each frame to S3
-            img_bytes = pil_to_jpeg_bytes(pil_frame)
-            s3_key = f"video_frames/frame_{int(conf*100)}_{int(torch.randint(0,1000000,(1,)))}.jpg"
-            upload_to_s3_bytes(img_bytes, s3_key)
-
-        cap_vid.release()
-        os.remove(temp_path)
-
-        if not stress_probs:
-            return jsonify({"error":"No frames found"})
-        avg_prob = float(np.mean(stress_probs))
-        final_label = "Stressed" if avg_prob > 0.5 else "Relaxed"
-        append_log({"label": final_label, "confidence": avg_prob*100})
-
-        return jsonify({"status": "success", "prediction": final_label, "stress_probability": avg_prob})
-
-    except Exception as e:
-        return jsonify({"error": str(e)})
+    if "file" not in request.files:
+        return jsonify({"error": "No file"}), 400
+    f = request.files["file"]
+    tmp = "uploaded_video.avi"
+    f.save(tmp)
+    cap = cv2.VideoCapture(tmp)
+    if not cap.isOpened():
+        return jsonify({"error": "Cannot open uploaded video"}), 400
+    probs = []
+    last_frame = None
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        last_frame = frame
+        probs.append(predict_confidence_from_bgr(frame))
+    cap.release()
+    if not probs:
+        return jsonify({"error": "No frames"}), 400
+    avg = float(sum(probs) / len(probs))
+    conf_pct = round(avg * 100, 1)
+    s3_key = None
+    if last_frame is not None:
+        s3_key = upload_frame_to_s3(last_frame)
+    return jsonify({"confidence": conf_pct, "s3_key": s3_key})
 
 if __name__ == "__main__":
-    if LOCAL_RUN:
-        print("Running locally at http://127.0.0.1:5000/")
-        app.run(host="127.0.0.1", port=5000, debug=True)
-    else:
-        print("Running on server/EC2, public access via browser")
-        app.run(host="0.0.0.0", port=5000, debug=True)
+    print("Starting Flask on http://127.0.0.1:5000")
+    app.run(host="0.0.0.0", port=5000, debug=True)
